@@ -8,10 +8,7 @@
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
 
-#include <windows.h>
-#include <softpub.h>
-#include <wintrust.h>
-#include <wincrypt.h>
+#include "auditor.h"
 
 #include <filesystem>
 #include <fstream>
@@ -21,8 +18,6 @@
 #include <set>
 #include <sstream>
 #include <iomanip>
-
-#pragma comment(lib, "Wintrust.lib")
 
 namespace fs = std::filesystem;
 
@@ -89,43 +84,44 @@ struct ManifestEntry
 // Signature check via WinVerifyTrust
 // Returns true  -> file is signed (and signature is valid)
 // Returns false -> unsigned or verification failed
+// (Superseded by auditor::IsFileSigned — kept for reference)
 // ---------------------------------------------------------------------------
 
-inline bool IsFileSigned(const fs::path& filePath)
-{
-    std::wstring wpath = filePath.wstring();
-
-    WINTRUST_FILE_INFO fileInfo = {};
-    fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
-    fileInfo.pcwszFilePath = wpath.c_str();
-    fileInfo.hFile = nullptr;
-    fileInfo.pgKnownSubject = nullptr;
-
-    GUID policyGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-
-    WINTRUST_DATA trustData = {};
-    trustData.cbStruct = sizeof(WINTRUST_DATA);
-    trustData.pPolicyCallbackData = nullptr;
-    trustData.pSIPClientData = nullptr;
-    trustData.dwUIChoice = WTD_UI_NONE;
-    trustData.fdwRevocationChecks = WTD_REVOKE_NONE;   // skip online revocation for speed
-    trustData.dwUnionChoice = WTD_CHOICE_FILE;
-    trustData.pFile = &fileInfo;
-    trustData.dwStateAction = WTD_STATEACTION_VERIFY;
-    trustData.hWVTStateData = nullptr;
-    trustData.pwszURLReference = nullptr;
-    trustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
-    trustData.dwUIContext = 0;
-
-    LONG status = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE),
-        &policyGuid, &trustData);
-
-    // Close the state data
-    trustData.dwStateAction = WTD_STATEACTION_CLOSE;
-    WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &policyGuid, &trustData);
-
-    return (status == ERROR_SUCCESS);
-}
+//inline bool IsFileSigned(const fs::path& filePath)
+//{
+//    std::wstring wpath = filePath.wstring();
+//
+//    WINTRUST_FILE_INFO fileInfo = {};
+//    fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+//    fileInfo.pcwszFilePath = wpath.c_str();
+//    fileInfo.hFile = nullptr;
+//    fileInfo.pgKnownSubject = nullptr;
+//
+//    GUID policyGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+//
+//    WINTRUST_DATA trustData = {};
+//    trustData.cbStruct = sizeof(WINTRUST_DATA);
+//    trustData.pPolicyCallbackData = nullptr;
+//    trustData.pSIPClientData = nullptr;
+//    trustData.dwUIChoice = WTD_UI_NONE;
+//    trustData.fdwRevocationChecks = WTD_REVOKE_NONE;   // skip online revocation for speed
+//    trustData.dwUnionChoice = WTD_CHOICE_FILE;
+//    trustData.pFile = &fileInfo;
+//    trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+//    trustData.hWVTStateData = nullptr;
+//    trustData.pwszURLReference = nullptr;
+//    trustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
+//    trustData.dwUIContext = 0;
+//
+//    LONG status = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE),
+//        &policyGuid, &trustData);
+//
+//    // Close the state data
+//    trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+//    WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &policyGuid, &trustData);
+//
+//    return (status == ERROR_SUCCESS);
+//}
 
 // ---------------------------------------------------------------------------
 // Pending_Sign folder layout helpers
@@ -241,10 +237,13 @@ inline void RunScanAndCollect()
 
         ++scanned;
 
-        bool signed_ = false;
+        int  sigCount  = 0;
+        bool testSig   = false;
         try
         {
-            signed_ = IsFileSigned(entry.path());
+            sigCount = IsFileSigned(entry.path());
+            if (sigCount > 0)
+                testSig = HasTestSignature(entry.path());
         }
         catch (...)
         {
@@ -254,12 +253,14 @@ inline void RunScanAndCollect()
             continue;
         }
 
-        if (!signed_)
+        if (sigCount == 0 || testSig)
         {
             ++unsigned_;
             std::string filename = w2u(entry.path().filename().wstring());
             std::string origFull = w2u(entry.path().wstring());
             std::string origRel  = w2u(entry.path().lexically_relative(targetDir).wstring());
+
+            const char* tag = testSig ? "[TEST SIGNED]" : "[UNSIGNED]   ";
 
             try
             {
@@ -274,7 +275,7 @@ inline void RunScanAndCollect()
                     continue;
                 }
                 entries.push_back({ relPath, origFull });
-                std::cout << "  [UNSIGNED] " << origRel << "\n"
+                std::cout << "  " << tag << " " << origRel << "\n"
                     << "         -> Pending_Sign/" << relPath << "\n";
             }
             catch (const std::exception& ex)
@@ -301,6 +302,6 @@ inline void RunScanAndCollect()
 
     std::cout << "\n--- Summary ---\n"
         << "  PE files scanned : " << scanned << "\n"
-        << "  Unsigned (copied): " << unsigned_ << "\n"
+        << "  Unsigned/test-signed (copied): " << unsigned_ << "\n"
         << "  Errors           : " << errors << "\n";
 }

@@ -8,71 +8,69 @@
 
 #include "snatcher.h"
 
-#include <vector>
-
 // ---------------------------------------------------------------------------
 // Check whether a file's leaf signer subject contains "Microsoft"
-// Call this only after IsFileSigned() already returned true.
+// (Superseded by IsSignedBy(path, "Microsoft") from auditor.h — kept for reference)
 // ---------------------------------------------------------------------------
 
-inline bool IsSignedByMicrosoft(const fs::path& filePath)
-{
-    std::wstring wpath = filePath.wstring();
-
-    HCERTSTORE hStore = nullptr;
-    HCRYPTMSG  hMsg   = nullptr;
-
-    if (!CryptQueryObject(
-        CERT_QUERY_OBJECT_FILE,
-        wpath.c_str(),
-        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
-        CERT_QUERY_FORMAT_FLAG_BINARY,
-        0, nullptr, nullptr, nullptr,
-        &hStore, &hMsg, nullptr))
-    {
-        return false;
-    }
-
-    bool isMicrosoft = false;
-
-    DWORD signerInfoSize = 0;
-    CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &signerInfoSize);
-
-    if (signerInfoSize > 0)
-    {
-        std::vector<BYTE> buf(signerInfoSize);
-        auto* signerInfo = reinterpret_cast<CMSG_SIGNER_INFO*>(buf.data());
-
-        if (CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, signerInfo, &signerInfoSize))
-        {
-            CERT_INFO certInfo        = {};
-            certInfo.Issuer           = signerInfo->Issuer;
-            certInfo.SerialNumber     = signerInfo->SerialNumber;
-
-            PCCERT_CONTEXT pCert = CertFindCertificateInStore(
-                hStore,
-                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-                0,
-                CERT_FIND_SUBJECT_CERT,
-                &certInfo,
-                nullptr);
-
-            if (pCert)
-            {
-                char name[512] = {};
-                CertGetNameStringA(pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE,
-                    0, nullptr, name, sizeof(name));
-                isMicrosoft = (std::string(name).find("Microsoft") != std::string::npos);
-                CertFreeCertificateContext(pCert);
-            }
-        }
-    }
-
-    CryptMsgClose(hMsg);
-    CertCloseStore(hStore, 0);
-
-    return isMicrosoft;
-}
+//inline bool IsSignedByMicrosoft(const fs::path& filePath)
+//{
+//    std::wstring wpath = filePath.wstring();
+//
+//    HCERTSTORE hStore = nullptr;
+//    HCRYPTMSG  hMsg   = nullptr;
+//
+//    if (!CryptQueryObject(
+//        CERT_QUERY_OBJECT_FILE,
+//        wpath.c_str(),
+//        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+//        CERT_QUERY_FORMAT_FLAG_BINARY,
+//        0, nullptr, nullptr, nullptr,
+//        &hStore, &hMsg, nullptr))
+//    {
+//        return false;
+//    }
+//
+//    bool isMicrosoft = false;
+//
+//    DWORD signerInfoSize = 0;
+//    CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &signerInfoSize);
+//
+//    if (signerInfoSize > 0)
+//    {
+//        std::vector<BYTE> buf(signerInfoSize);
+//        auto* signerInfo = reinterpret_cast<CMSG_SIGNER_INFO*>(buf.data());
+//
+//        if (CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, signerInfo, &signerInfoSize))
+//        {
+//            CERT_INFO certInfo        = {};
+//            certInfo.Issuer           = signerInfo->Issuer;
+//            certInfo.SerialNumber     = signerInfo->SerialNumber;
+//
+//            PCCERT_CONTEXT pCert = CertFindCertificateInStore(
+//                hStore,
+//                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+//                0,
+//                CERT_FIND_SUBJECT_CERT,
+//                &certInfo,
+//                nullptr);
+//
+//            if (pCert)
+//            {
+//                char name[512] = {};
+//                CertGetNameStringA(pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+//                    0, nullptr, name, sizeof(name));
+//                isMicrosoft = (std::string(name).find("Microsoft") != std::string::npos);
+//                CertFreeCertificateContext(pCert);
+//            }
+//        }
+//    }
+//
+//    CryptMsgClose(hMsg);
+//    CertCloseStore(hStore, 0);
+//
+//    return isMicrosoft;
+//}
 
 // ---------------------------------------------------------------------------
 // Option 3 – Scan & Report (no file collection)
@@ -128,14 +126,14 @@ inline void RunScanAndReport()
 
         try
         {
-            bool signed_ = IsFileSigned(entry.path());
+            int sigCount = IsFileSigned(entry.path());
 
-            if (!signed_)
+            if (sigCount == 0)
             {
                 ++flagged;
                 std::cout << "  [UNSIGNED]      " << origRel << "\n";
             }
-            else if (isSys && !IsSignedByMicrosoft(entry.path()))
+            else if (isSys && !IsSignedBy(entry.path(), "Microsoft"))
             {
                 ++flagged;
                 std::cout << "  [NOT MICROSOFT] " << origRel << "\n";

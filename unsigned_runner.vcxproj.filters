@@ -26,5 +26,11 @@
     <ClInclude Include="snatcher.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="auditor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="snitcher.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

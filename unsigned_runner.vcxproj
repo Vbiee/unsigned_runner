@@ -130,8 +130,10 @@
     <ClCompile Include="unsigned_runner.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="auditor.h" />
     <ClInclude Include="courier.h" />
     <ClInclude Include="snatcher.h" />
+    <ClInclude Include="snitcher.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
