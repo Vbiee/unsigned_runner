@@ -17,8 +17,6 @@
 #pragma comment(lib, "Winhttp.lib")
 
 #include <map>
-#include <random>
-#include <chrono>
 #include <sstream>
 
 // ---------------------------------------------------------------------------
@@ -444,50 +442,84 @@ static std::string Signore_ParseCookie(const std::string& raw)
 }
 
 // ---------------------------------------------------------------------------
-// Multipart form-data builder
+// curl.exe helpers
 // ---------------------------------------------------------------------------
 
-static std::string Signore_MakeBoundary()
+// Write a Netscape-format cookie file so curl -b/-c can use the session cookie.
+// `cookieHeader` is a "name=value; name2=value2" string returned by the server.
+static bool Signore_WriteCookieFile(
+    const fs::path& cookiePath,
+    const SigUrl&   url,
+    const std::string& cookieHeader)
 {
-    static const char hex[] = "0123456789abcdef";
-    std::string b = "----SignoreBoundary";
-    auto seed = static_cast<unsigned>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
-    std::mt19937 rng(seed);
-    std::uniform_int_distribution<int> d(0, 15);
-    for (int i = 0; i < 16; ++i) b += hex[d(rng)];
-    return b;
+    std::ofstream f(cookiePath);
+    if (!f) return false;
+    f << "# Netscape HTTP Cookie File\n";
+
+    std::string domain  = w2u(url.host);
+    const char* secure  = url.secure ? "TRUE" : "FALSE";
+
+    std::istringstream ss(cookieHeader);
+    std::string token;
+    while (std::getline(ss, token, ';'))
+    {
+        while (!token.empty() && isspace((unsigned char)token.front())) token.erase(token.begin());
+        while (!token.empty() && isspace((unsigned char)token.back()))  token.pop_back();
+        if (token.empty()) continue;
+
+        auto eq = token.find('=');
+        std::string name  = (eq != std::string::npos) ? token.substr(0, eq) : token;
+        std::string value = (eq != std::string::npos) ? token.substr(eq + 1) : std::string{};
+
+        // domain  include_subdomains  path  secure  expiry  name  value
+        f << domain << "\tFALSE\t/\t" << secure << "\t0\t" << name << "\t" << value << "\n";
+    }
+    return f.good();
 }
 
-// Each entry: {fieldName, absoluteFilePath}
-static std::vector<BYTE> Signore_BuildMultipart(
-    const std::string& boundary,
-    const std::vector<std::pair<std::string, fs::path>>& files)
+// Run curl.exe with `args`.  If stdoutPath is non-empty, stdout is redirected
+// there; otherwise stdout/stderr are inherited from the parent console.
+// Returns the exit code, or -1 if curl could not be launched.
+static int Signore_RunCurl(const std::wstring& args, const fs::path& stdoutPath)
 {
-    std::vector<BYTE> body;
-    auto add = [&](const std::string& s)
-        { body.insert(body.end(), s.begin(), s.end()); };
+    std::wstring cmd = L"curl.exe " + args;
 
-    for (const auto& [field, path] : files)
+    HANDLE hOut = INVALID_HANDLE_VALUE;
+    if (!stdoutPath.empty())
     {
-        std::string fname = w2u(path.filename().wstring());
-        add("--" + boundary + "\r\n");
-        add("Content-Disposition: form-data; name=\"" + field +
-            "\"; filename=\"" + fname + "\"\r\n");
-        add("Content-Type: application/octet-stream\r\n\r\n");
-
-        std::ifstream f(path, std::ios::binary);
-        if (f)
-        {
-            std::vector<char> buf(
-                (std::istreambuf_iterator<char>(f)),
-                std::istreambuf_iterator<char>());
-            body.insert(body.end(), buf.begin(), buf.end());
-        }
-        add("\r\n");
+        SECURITY_ATTRIBUTES sa = {};
+        sa.nLength        = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        hOut = CreateFileW(stdoutPath.wstring().c_str(),
+            GENERIC_WRITE, 0, &sa,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hOut == INVALID_HANDLE_VALUE) return -1;
     }
-    add("--" + boundary + "--\r\n");
-    return body;
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    if (hOut != INVALID_HANDLE_VALUE)
+    {
+        si.dwFlags    = STARTF_USESTDHANDLES;
+        si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdOutput = hOut;
+        si.hStdError  = hOut;
+    }
+
+    PROCESS_INFORMATION pi = {};
+    BOOL ok = CreateProcessW(nullptr, cmd.data(),
+        nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+        nullptr, nullptr, &si, &pi);
+
+    if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
+    if (!ok) return -1;
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return static_cast<int>(exitCode);
 }
 
 // ---------------------------------------------------------------------------
@@ -662,12 +694,6 @@ inline void RunSignCollected()
     }
     if (uploadItems.empty()) { std::cerr << "Error: No staged files found.\n"; return; }
 
-    // Flatten to the format BuildMultipart expects
-    std::vector<std::pair<std::string, fs::path>> uploadFiles;
-    uploadFiles.reserve(uploadItems.size());
-    for (const auto& item : uploadItems)
-        uploadFiles.emplace_back("files", item.src);
-
     // 4. Open WinHTTP session
     HINTERNET hSession = WinHttpOpen(
         L"unsigned_runner/1.0",
@@ -701,6 +727,7 @@ inline void RunSignCollected()
     if (loginBodyStr.find("Login - File Signer") != std::string::npos)
     {
         std::cerr << "Error: Login failed – incorrect username or password.\n";
+        WinHttpCloseHandle(hSession);
         return;
     }
 
@@ -708,238 +735,199 @@ inline void RunSignCollected()
     if (cookie.empty())
     {
         std::cerr << "Error: No session cookie received from server.\n";
+        WinHttpCloseHandle(hSession);
         return;
     }
     std::cout << "Login successful.\n";
+    WinHttpCloseHandle(hSession);
 
-    // Build filename -> entries map once (shared across all batches)
+    // Build filename -> entries map
     std::map<std::string, std::vector<const ManifestEntry*>> byName;
     for (const auto& e : entries)
         byName[w2u(fs::path(s2w(e.relativePath)).filename().wstring())].push_back(&e);
 
+    // Temp file paths
     wchar_t tempPathBuf[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, tempPathBuf);
-    fs::path tempZip     = fs::path(tempPathBuf) / L"signore_signed.zip";
-    fs::path tempExtract = fs::path(tempPathBuf) / L"signore_extract";
+    fs::path tempCookieFile = fs::path(tempPathBuf) / L"signore_cookie.txt";
+    fs::path tempRespFile   = fs::path(tempPathBuf) / L"signore_upload_resp.txt";
+    fs::path tempZip        = fs::path(tempPathBuf) / L"signore_signed.zip";
+    fs::path tempExtract    = fs::path(tempPathBuf) / L"signore_extract";
 
-    constexpr size_t kBatchSize       = 5;
-    constexpr DWORD  kUploadTimeoutMs = 10 * 60 * 1000;   // 10 min for server-side signing
-
-    size_t replaced = 0, skipped = 0;
-    size_t batchCount = (uploadFiles.size() + kBatchSize - 1) / kBatchSize;
-
-    // 6. Upload → download → extract in batches
-    for (size_t b = 0; b < uploadFiles.size(); b += kBatchSize)
+    // 6. Write Netscape cookie file for curl
+    if (!Signore_WriteCookieFile(tempCookieFile, url, cookie))
     {
-        size_t bEnd     = min(b + kBatchSize, uploadFiles.size());
-        size_t bNum     = b / kBatchSize + 1;
+        std::cerr << "Error: Cannot write cookie file.\n";
+        return;
+    }
 
-        std::cout << "\nBatch " << bNum << "/" << batchCount
-                  << " (" << (bEnd - b) << " file(s)):\n";
+    // 7. Upload all files in one curl call (mirrors PS1 behavior)
+    std::cout << "\nUploading " << uploadItems.size() << " file(s):\n";
+    for (size_t i = 0; i < uploadItems.size(); ++i)
+    {
+        std::error_code ec;
+        auto sz = fs::file_size(uploadItems[i].src, ec);
+        char idx[16];
+        snprintf(idx, sizeof(idx), "[%2zu/%2zu]", i + 1, uploadItems.size());
+        std::cout << "  " << idx << "  " << uploadItems[i].relPath;
+        if (!ec) std::cout << "  (" << sz / 1024 << " KB)";
+        std::cout << "\n";
+    }
 
-        // List files in this batch
-        for (size_t i = b; i < bEnd; ++i)
+    std::wstring curlUploadArgs =
+        L"-k -L -s "
+        L"-b \"" + tempCookieFile.wstring() + L"\" "
+        L"-c \"" + tempCookieFile.wstring() + L"\" "
+        L"-X POST ";
+    for (const auto& item : uploadItems)
+        curlUploadArgs += L"-F \"files=@\\\"" + item.src.wstring() + L"\\\"\" ";
+    curlUploadArgs += s2w(vars["BASE_URL"] + "/upload");
+
+    std::cout << "Uploading...\n";
+    int curlRet = Signore_RunCurl(curlUploadArgs, tempRespFile);
+    if (curlRet != 0)
+    {
+        std::cerr << "Error: curl upload exited with code " << curlRet << ".\n";
+        return;
+    }
+    {
+        std::ifstream rf(tempRespFile);
+        std::string respBody((std::istreambuf_iterator<char>(rf)),
+                              std::istreambuf_iterator<char>());
+        if (respBody.find("Login - File Signer") != std::string::npos)
         {
-            std::error_code ec;
-            auto sz = fs::file_size(uploadItems[i].src, ec);
-            char idx[16];
-            snprintf(idx, sizeof(idx), "[%2zu/%2zu]", i + 1, uploadFiles.size());
-            std::cout << "  " << idx << "  " << uploadItems[i].relPath;
-            if (!ec) std::cout << "  (" << sz / 1024 << " KB)";
-            std::cout << "\n";
-        }
-
-        // Build multipart body for this batch only
-        std::vector<std::pair<std::string, fs::path>> batchFiles(
-            uploadFiles.begin() + b, uploadFiles.begin() + bEnd);
-
-        std::string      boundary     = Signore_MakeBoundary();
-        std::vector<BYTE> multipartBody = Signore_BuildMultipart(boundary, batchFiles);
-
-        std::cout << "Uploading (" << multipartBody.size() / 1024 << " KB)...\n";
-
-        std::wstring uploadHeaders =
-            L"Cookie: " + s2w(cookie) + L"\r\n"
-            L"Content-Type: multipart/form-data; boundary=" + s2w(boundary) + L"\r\n";
-
-        SigResponse uploadResp;
-        if (!Signore_Send(hSession, url, L"POST", url.basePath + L"/upload",
-                uploadHeaders, multipartBody.data(), (DWORD)multipartBody.size(),
-                uploadResp, &httpErr, kUploadTimeoutMs))
-        {
-            std::cerr << "Error: Upload failed – " << httpErr << "\n";
-            WinHttpCloseHandle(hSession);
+            std::cerr << "Error: Upload rejected – session invalid (redirected to login).\n";
             return;
         }
-        {
-            std::string body(uploadResp.body.begin(), uploadResp.body.end());
-            if (body.find("Login - File Signer") != std::string::npos)
-            {
-                std::cerr << "Error: Upload rejected – session invalid.\n";
-                WinHttpCloseHandle(hSession);
-                return;
-            }
-        }
-        // Mirror curl -c: capture any updated session cookie from upload response
-        if (!uploadResp.setCookie.empty())
-        {
-            std::string updated = Signore_ParseCookie(uploadResp.setCookie);
-            if (!updated.empty()) cookie = updated;
-        }
-        std::cout << "Upload completed.\n";
+    }
+    std::cout << "Upload completed.\n";
 
-        // Download signed ZIP
-        std::cout << "Downloading signed files...\n";
-        std::wstring dlHeaders = L"Cookie: " + s2w(cookie) + L"\r\n";
+    // 8. Download signed ZIP via curl
+    std::cout << "Downloading signed files...\n";
+    std::wstring curlDlArgs =
+        L"-k -L -s "
+        L"-b \"" + tempCookieFile.wstring() + L"\" "
+        L"-o \"" + tempZip.wstring() + L"\" "
+        + s2w(vars["BASE_URL"] + "/download-all");
 
-        SigResponse dlResp;
-        if (!Signore_Send(hSession, url, L"GET", url.basePath + L"/download-all",
-                dlHeaders, nullptr, 0, dlResp, &httpErr))
-        {
-            std::cerr << "Error: Download failed – " << httpErr << "\n";
-            WinHttpCloseHandle(hSession);
-            return;
-        }
+    curlRet = Signore_RunCurl(curlDlArgs, {});
+    if (curlRet != 0)
+    {
+        std::cerr << "Error: curl download exited with code " << curlRet << ".\n";
+        return;
+    }
 
-        // Follow redirect (mirrors curl -L)
-        if (dlResp.status / 100 == 3 && !dlResp.location.empty())
-        {
-            std::cout << "  [redirect] " << dlResp.location << "\n";
-            SigUrl      redirUrl  = url;
-            std::wstring redirPath;
-            if (dlResp.location.substr(0, 4) == "http")
-            {
-                Signore_ParseUrl(dlResp.location, redirUrl);
-                redirPath = redirUrl.basePath;
-            }
-            else
-            {
-                redirPath = s2w(dlResp.location);
-            }
-            dlResp = {};
-            if (!Signore_Send(hSession, redirUrl, L"GET", redirPath,
-                    dlHeaders, nullptr, 0, dlResp, &httpErr))
-            {
-                std::cerr << "Error: Download (redirect) failed – " << httpErr << "\n";
-                WinHttpCloseHandle(hSession);
-                return;
-            }
-        }
+    if (!fs::exists(tempZip))
+    {
+        std::cerr << "Error: Download failed – output file not created.\n";
+        return;
+    }
 
-        if (dlResp.body.size() < 200)
-        {
-            std::cerr << "Error: Downloaded content too small ("
-                      << dlResp.body.size() << " bytes) – server response:\n";
-            std::cerr.write(reinterpret_cast<const char*>(dlResp.body.data()),
-                dlResp.body.size());
-            std::cerr << "\n";
-            WinHttpCloseHandle(hSession);
-            return;
-        }
+    std::error_code ec;
+    auto zipSize = fs::file_size(tempZip, ec);
+    if (ec || zipSize < 200)
+    {
+        std::cerr << "Error: Downloaded content too small (" << zipSize << " bytes).\n";
+        return;
+    }
 
-        if (dlResp.body[0] != 'P' || dlResp.body[1] != 'K' ||
-            dlResp.body[2] != 0x03 || dlResp.body[3] != 0x04)
+    // Validate ZIP magic bytes
+    {
+        std::ifstream zf(tempZip, std::ios::binary);
+        char magic[4] = {};
+        zf.read(magic, 4);
+        if (magic[0] != 'P' || magic[1] != 'K' || magic[2] != 0x03 || magic[3] != 0x04)
         {
             std::cerr << "Error: Response is not a ZIP file. Server said:\n";
-            std::cerr.write(reinterpret_cast<const char*>(dlResp.body.data()),
-                min(dlResp.body.size(), static_cast<size_t>(512)));
+            zf.seekg(0);
+            std::string content((std::istreambuf_iterator<char>(zf)),
+                                  std::istreambuf_iterator<char>());
+            std::cerr.write(content.data(), min(content.size(), static_cast<size_t>(512)));
             std::cerr << "\n";
-            WinHttpCloseHandle(hSession);
             return;
         }
+    }
+    std::cout << "Downloaded: " << zipSize << " bytes.\n";
+    std::cout << "Saved to: " << w2u(tempZip.wstring()) << "\n";
 
-        std::cout << "Downloaded: " << dlResp.body.size() << " bytes.\n";
+    // 9. Extract
+    fs::remove_all(tempExtract, ec);
+    fs::create_directories(tempExtract, ec);
 
-        // Save ZIP
+    if (!Signore_ExtractZip(tempZip, tempExtract))
+    {
+        std::cerr << "Error: ZIP extraction failed.\n";
+        return;
+    }
+
+    // Log extracted files
+    std::cout << "Extracted files:\n";
+    size_t extractCount = 0;
+    for (auto& item : fs::recursive_directory_iterator(tempExtract, ec))
+    {
+        if (!item.is_regular_file(ec)) continue;
+        auto sz = fs::file_size(item.path(), ec);
+        std::cout << "  " << w2u(item.path().lexically_relative(tempExtract).wstring())
+                  << "  (" << sz / 1024 << " KB)\n";
+        ++extractCount;
+    }
+    if (extractCount == 0)
+        std::cerr << "  (none – ZIP may be empty or extraction silently failed)\n";
+
+    // 10. Replace files in Pending_Sign
+    std::cout << "Replacing files in Pending_Sign...\n";
+    size_t replaced = 0, skipped = 0;
+
+    for (auto& item : fs::recursive_directory_iterator(tempExtract, ec))
+    {
+        if (!item.is_regular_file(ec)) continue;
+
+        std::string extractedName = w2u(item.path().filename().wstring());
+
+        auto tryReplace = [&](const std::string& name) -> bool
         {
-            std::ofstream zf(tempZip, std::ios::binary);
-            if (!zf) { std::cerr << "Error: Cannot write temp ZIP.\n";
-                       WinHttpCloseHandle(hSession); return; }
-            zf.write(reinterpret_cast<const char*>(dlResp.body.data()),
-                     static_cast<std::streamsize>(dlResp.body.size()));
-        }
-        std::cout << "Saved to: " << w2u(tempZip.wstring()) << "\n";
+            auto it = byName.find(name);
+            if (it == byName.end()) return false;
 
-        // Extract
-        std::error_code ec;
-        fs::remove_all(tempExtract, ec);
-        fs::create_directories(tempExtract, ec);
-
-        if (!Signore_ExtractZip(tempZip, tempExtract))
-        {
-            std::cerr << "Error: ZIP extraction failed.\n";
-            WinHttpCloseHandle(hSession);
-            return;
-        }
-
-        // Log extracted files
-        std::cout << "Extracted files:\n";
-        size_t extractCount = 0;
-        for (auto& item : fs::recursive_directory_iterator(tempExtract, ec))
-        {
-            if (!item.is_regular_file(ec)) continue;
-            auto sz = fs::file_size(item.path(), ec);
-            std::cout << "  " << w2u(item.path().lexically_relative(tempExtract).wstring())
-                      << "  (" << sz / 1024 << " KB)\n";
-            ++extractCount;
-        }
-        if (extractCount == 0)
-            std::cerr << "  (none – ZIP may be empty or extraction silently failed)\n";
-
-        // Replace files in Pending_Sign for this batch
-        std::cout << "Replacing files in Pending_Sign...\n";
-
-        for (auto& item : fs::recursive_directory_iterator(tempExtract, ec))
-        {
-            if (!item.is_regular_file(ec)) continue;
-
-            std::string extractedName = w2u(item.path().filename().wstring());
-
-            auto tryReplace = [&](const std::string& name) -> bool
+            for (const ManifestEntry* me : it->second)
             {
-                auto it = byName.find(name);
-                if (it == byName.end()) return false;
-
-                for (const ManifestEntry* me : it->second)
+                fs::path dest = pendingDir / s2w(me->relativePath);
+                fs::copy_file(item.path(), dest,
+                    fs::copy_options::overwrite_existing, ec);
+                if (ec)
                 {
-                    fs::path dest = pendingDir / s2w(me->relativePath);
-                    fs::copy_file(item.path(), dest,
-                        fs::copy_options::overwrite_existing, ec);
-                    if (ec)
-                    {
-                        std::cerr << "  [ERROR] " << me->relativePath
-                                  << ": " << ec.message() << "\n";
-                        return false;
-                    }
-                    std::cout << "  [OK] " << me->relativePath;
-                    try { std::cout << (IsFileSigned(dest) > 0
-                            ? " (verified signed)\n" : " (STILL UNSIGNED)\n"); }
-                    catch (...) { std::cout << "\n"; }
-                    ++replaced;
+                    std::cerr << "  [ERROR] " << me->relativePath
+                              << ": " << ec.message() << "\n";
+                    return false;
                 }
-                return true;
-            };
+                std::cout << "  [OK] " << me->relativePath;
+                try { std::cout << (IsFileSigned(dest) > 0
+                        ? " (verified signed)\n" : " (STILL UNSIGNED)\n"); }
+                catch (...) { std::cout << "\n"; }
+                ++replaced;
+            }
+            return true;
+        };
 
-            if (!tryReplace(extractedName))
+        if (!tryReplace(extractedName))
+        {
+            std::string alt = extractedName;
+            bool changed = false;
+            for (char& c : alt) if (c == ' ')  { c = '_'; changed = true; }
+            if (!changed)
+                for (char& c : alt) if (c == '_') { c = ' '; changed = true; }
+
+            if (!changed || !tryReplace(alt))
             {
-                std::string alt = extractedName;
-                bool changed = false;
-                for (char& c : alt) if (c == ' ')  { c = '_'; changed = true; }
-                if (!changed)
-                    for (char& c : alt) if (c == '_') { c = ' '; changed = true; }
-
-                if (!changed || !tryReplace(alt))
-                {
-                    std::cout << "  [SKIP] No manifest match for: " << extractedName << "\n";
-                    ++skipped;
-                }
+                std::cout << "  [SKIP] No manifest match for: " << extractedName << "\n";
+                ++skipped;
             }
         }
+    }
 
-        fs::remove_all(tempExtract, ec);   // clean up before next batch
-    }   // end batch loop
-
-    WinHttpCloseHandle(hSession);
+    fs::remove_all(tempExtract, ec);
+    fs::remove(tempCookieFile, ec);
+    fs::remove(tempRespFile, ec);
 
     std::cout << "\n--- Summary ---\n"
               << "  Replaced : " << replaced << "\n"
