@@ -7,7 +7,7 @@
 //   cl /std:c++17 /EHsc unsigned_runner.cpp /link Wintrust.lib
 //
 
-#include "courier.h"
+#include "signore.h"
 
 // ---------------------------------------------------------------------------
 // Console UI
@@ -53,6 +53,12 @@ static void PrintMenu()
         << "  \xba  " << ORANGE << BOLD << " 3 " << RESET << BG_DARK << WHITE << "  Scan & Report only (no collection)  " << CYAN << "\xba\n"
         << "  \xba  " << RESET  << BG_DARK << GRAY << DIM << "     SYS flagged if not by Microsoft  " << RESET << BG_DARK << CYAN << "  \xba\n"
         << "  \xba                                          \xba\n"
+        << "  \xba  " << CYAN   << BOLD << " 4 " << RESET << BG_DARK << WHITE << "  Sign collected files via server     " << CYAN << "\xba\n"
+        << "  \xba  " << RESET  << BG_DARK << GRAY << DIM << "     Pending_Sign\\ \xbb sign \xbb Pending_Sign\\  " << RESET << BG_DARK << CYAN << "  \xba\n"
+        << "  \xba                                          \xba\n"
+        << "  \xba  " << WHITE  << BOLD << " 5 " << RESET << BG_DARK << WHITE << "  Setup signing credentials           " << CYAN << "\xba\n"
+        << "  \xba  " << RESET  << BG_DARK << GRAY << DIM << "     Encrypt & save to signore.env    " << RESET << BG_DARK << CYAN << "  \xba\n"
+        << "  \xba                                          \xba\n"
         << "  \xba  " << RED    << BOLD << " 0 " << RESET << BG_DARK << WHITE << "  Exit                                " << CYAN << "\xba\n"
         << "  \xc8\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xcd\xbc\n"
         << RESET
@@ -76,6 +82,8 @@ int main()
 
         if      (choice == "1") RunScanAndCollect();
         else if (choice == "2") RunRestoreSigned();
+        else if (choice == "4") RunSignCollected();
+        else if (choice == "5") RunSetupSigningCreds();
         else if (choice == "0") { std::cout << "  Bye.\n\n"; break; }
         else    std::cerr << "  \033[38;2;220;80;80m[!] Invalid choice.\033[0m\n";
 

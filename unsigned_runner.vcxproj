@@ -132,6 +132,7 @@
   <ItemGroup>
     <ClInclude Include="auditor.h" />
     <ClInclude Include="courier.h" />
+    <ClInclude Include="signore.h" />
     <ClInclude Include="snatcher.h" />
     <ClInclude Include="snitcher.h" />
   </ItemGroup>
